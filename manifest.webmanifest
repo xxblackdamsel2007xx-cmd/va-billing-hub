@@ -1,0 +1,9 @@
+{
+  "name": "VA Billing Hub",
+  "short_name": "VA Billing",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#172033",
+  "description": "Private VA invoice and recurring billing manager"
+}
