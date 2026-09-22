@@ -118,4 +118,146 @@ function renderLists(){ $('clientList').innerHTML=state.clients.length?state.cli
 function render(){renderOrgSwitcher();populate();renderLists();applyRoleAccess();const review=state.invoices.filter(x=>x.status==='needs_review'),scheduled=state.invoices.filter(x=>x.status==='scheduled'),outstanding=state.invoices.filter(x=>['sent','overdue','payment_pending'].includes(x.status));$('sReview').textContent=review.length;$('sScheduled').textContent=scheduled.length;$('sOutstanding').textContent=outstanding.length;const dl=review.concat(scheduled);$('dashList').innerHTML=dl.length?dl.slice(0,8).map(x=>card(x,x.status==='needs_review')).join(''):'<div class="muted">Nothing needs your attention.</div>';$('reviewList').innerHTML=review.length?review.map(x=>card(x,true)).join(''):'<div class="muted">No invoices waiting for review.</div>';const checks=state.invoices.filter(x=>['sent','payment_pending','paid'].includes(x.status)).sort((a,b)=>String(b.sent_at||'').localeCompare(String(a.sent_at||'')));$('paymentList').innerHTML=checks.length?checks.map(x=>{const clientName=state.clients.find(c=>c.id===x.client_id)?.company_name||'Client',due=paymentCheckDue(x),paid=x.status==='paid',followUp=x.status==='payment_pending';return `<div class="item ${paid?'payment-paid':due||followUp?'payment-due':''}"><div><strong>${esc(clientName)} • ${esc(x.invoice_number)}</strong><span class="muted">${paid?'Payment confirmed':followUp?'Need follow-up':due?'Bank check is due':'Waiting for the 3-business-day check'} • ${money(x.total,x.currency)}</span></div><div class="payment-action">${paid?'<span class="badge green">Paid</span>':followUp?`<span class="badge warn">Need follow-up</span><button class="secondary" onclick="resendInvoiceReminder('${x.id}')">Resend invoice reminder</button><button class="primary" onclick="markPaid('${x.id}')">Mark as Paid</button>`:`<button class="secondary" onclick="markNeedFollowUp('${x.id}')">Need Follow-up</button><button class="primary" onclick="markPaid('${x.id}')">Mark as Paid</button>`}</div></div>`}).join(''):'<div class="muted">No sent invoices are waiting for payment confirmation.</div>'}
 function initFormDates(){if(!$('iDate').value)$('iDate').value=today();if(!$('iEnd').value){const d=new Date();d.setDate(d.getDate()+14);$('iEnd').value=d.toISOString().slice(0,10)}if(!$('iSend').value)$('iSend').value=$('iEnd').value;if(!$('iDue').value)$('iDue').value=$('iSend').value}
 client.auth.getSession().then(({data})=>{if(data.session)bootstrap(data.session.user);else initFormDates()});client.auth.onAuthStateChange((_event,session)=>{if(session&&!state.user)bootstrap(session.user)});initFormDates();addVaServiceRow();
+// Account-holder ownership and reminder routing update.
+const saveInvoiceWithoutOwnership = saveInvoice;
+saveInvoice = async function (sendNow = false) {
+  if (editingInvoiceId) return saveInvoiceWithoutOwnership(sendNow);
+
+  const existingInvoiceIds = new Set(state.invoices.map((invoice) => invoice.id));
+  await saveInvoiceWithoutOwnership(sendNow);
+
+  const newInvoice = state.invoices.find(
+    (invoice) => !existingInvoiceIds.has(invoice.id),
+  );
+  if (!newInvoice || !state.user?.id) return;
+
+  const ownershipUpdate = await client
+    .from("invoices")
+    .update({ created_by: state.user.id })
+    .eq("id", newInvoice.id)
+    .eq("organization_id", state.org.id);
+
+  if (ownershipUpdate.error) {
+    alert("Invoice saved, but account ownership could not be recorded: " + ownershipUpdate.error.message);
+    return;
+  }
+
+  await client
+    .from("recurring_schedules")
+    .update({ created_by: state.user.id })
+    .eq("organization_id", state.org.id)
+    .eq("schedule_name", newInvoice.invoice_number);
+
+  await refresh();
+  render();
+};
+
+sendInvoiceEmail = async function (id) {
+  const invoice = state.invoices.find((item) => item.id === id);
+  if (!invoice) return;
+
+  const recipient = accountingRecipient(invoice);
+  if (!recipient) return alert("Add an Accounting Email on this client before sending.");
+  if (!confirm(`Send ${invoice.invoice_number} to ${recipient}?`)) return;
+
+  const ownershipUpdate = await client
+    .from("invoices")
+    .update({
+      created_by: invoice.created_by || state.user.id,
+      sent_by: state.user.id,
+    })
+    .eq("id", id)
+    .eq("organization_id", state.org.id);
+
+  if (ownershipUpdate.error) {
+    return alert("Email was not sent: " + ownershipUpdate.error.message);
+  }
+
+  const { data, error } = await client.functions.invoke("send-invoice", {
+    body: { invoiceId: id },
+  });
+
+  if (error || data?.error) {
+    return alert("Email was not sent: " + (error?.message || data?.error));
+  }
+
+  await refresh();
+  alert(`Invoice sent to ${data.recipient}. Payment reminders will go to your login email.`);
+};
+
+resendInvoiceReminder = async function (id) {
+  const invoice = state.invoices.find((item) => item.id === id);
+  if (!invoice) return;
+
+  const recipient = accountingRecipient(invoice);
+  if (!recipient) return alert("Add the client accounting email before sending a reminder.");
+  if (!confirm(`Resend ${invoice.invoice_number} as a payment reminder to ${recipient}?`)) return;
+
+  const saved = await client
+    .from("invoices")
+    .update({
+      status: "payment_pending",
+      created_by: invoice.created_by || state.user.id,
+      sent_by: invoice.sent_by || state.user.id,
+    })
+    .eq("id", id)
+    .eq("organization_id", state.org.id);
+
+  if (saved.error) return alert(saved.error.message);
+
+  await client.from("invoice_events").insert({
+    organization_id: state.org.id,
+    invoice_id: id,
+    event_type: "payment_reminder_sent",
+    event_note: `Account holder requested an invoice payment reminder for ${recipient}.`,
+    created_by: state.user.id,
+  });
+
+  const { data, error } = await client.functions.invoke("send-invoice", {
+    body: { invoiceId: id, mode: "payment_reminder" },
+  });
+
+  if (error || data?.error) {
+    await refresh();
+    render();
+    return alert("Reminder status saved, but the email could not be sent: " + (error?.message || data?.error));
+  }
+
+  await refresh();
+  render();
+  alert(`Invoice reminder sent to ${recipient}.`);
+};
+
+const renderAllInvoices = render;
+render = function () {
+  renderAllInvoices();
+
+  const checks = state.invoices
+    .filter(
+      (invoice) =>
+        ["sent", "payment_pending", "paid"].includes(invoice.status) &&
+        (invoice.sent_by === state.user.id ||
+          (!invoice.sent_by && invoice.created_by === state.user.id)),
+    )
+    .sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
+
+  $("paymentList").innerHTML = checks.length
+    ? checks
+        .map((invoice) => {
+          const clientName =
+            state.clients.find((client) => client.id === invoice.client_id)?.company_name || "Client";
+          const due = paymentCheckDue(invoice);
+          const paid = invoice.status === "paid";
+          const followUp = invoice.status === "payment_pending";
+
+          return `<div class="item ${paid ? "payment-paid" : due || followUp ? "payment-due" : ""}"><div><strong>${esc(clientName)} • ${esc(invoice.invoice_number)}</strong><span class="muted">${paid ? "Payment confirmed" : followUp ? "Need follow-up" : due ? "Bank check is due" : "Waiting for the 3-business-day check"} • ${money(invoice.total, invoice.currency)}</span></div><div class="payment-action">${paid ? '<span class="badge green">Paid</span>' : followUp ? `<span class="badge warn">Need follow-up</span><button class="secondary" onclick="resendInvoiceReminder('${invoice.id}')">Resend invoice reminder</button><button class="primary" onclick="markPaid('${invoice.id}')">Mark as Paid</button>` : `<button class="secondary" onclick="markNeedFollowUp('${invoice.id}')">Need Follow-up</button><button class="primary" onclick="markPaid('${invoice.id}')">Mark as Paid</button>`}</div></div>`;
+        })
+        .join("")
+    : '<div class="muted">No invoices assigned to your account are waiting for payment confirmation.</div>';
+};
+
+const vaEmailInput = $("vEmail");
+if (vaEmailInput) {
+  vaEmailInput.placeholder = "Only when client accounting requests it";
+}
 </script></body></html>
