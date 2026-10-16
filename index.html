@@ -183,6 +183,7 @@ sendInvoiceEmail = async function (id) {
   }
 
   await refresh();
+  render();
   alert(`Invoice sent to ${data.recipient}. Payment reminders will go to your login email.`);
 };
 
